@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "codex-litellm-adapter"
+version = "0.1.0"
+description = "A protocol adapter connecting Codex clients to LiteLLM gateways"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "NekoPara AI"}]
+keywords = ["codex", "litellm", "responses-api", "sse", "websocket"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: AsyncIO",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "aiohttp>=3.13.3,<4",
+  "multidict>=6,<7",
+  "yarl>=1.17,<2",
+  "backports.zstd>=1.0; python_version < '3.14'",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "build>=1.2"]
+
+[project.scripts]
+codex-litellm-adapter = "codex_litellm_adapter.server:main"
+
+[project.urls]
+Homepage = "https://github.com/nekopara-ai/codex-litellm-adapter"
+Repository = "https://github.com/nekopara-ai/codex-litellm-adapter"
+Issues = "https://github.com/nekopara-ai/codex-litellm-adapter/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/codex_litellm_adapter"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/docs", "/examples", "/scripts", "/README.md", "/README.zh-CN.md", "/LICENSE", "/pyproject.toml", "/SECURITY.md", "/CHANGELOG.md", "/CONTRIBUTING.md", "/Dockerfile", "/compose.yaml", "/.env.example"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = ["ignore:It is recommended to use web.AppKey:UserWarning"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

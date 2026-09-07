@@ -1,0 +1,14 @@
+{
+  "models": [
+    {
+      "slug": "your-gateway-model",
+      "display_name": "Example coding model",
+      "description": "Replace this entry with your gateway model's actual capabilities",
+      "context_window": 128000,
+      "effective_context_window_percent": 95,
+      "supported_reasoning_levels": [],
+      "apply_patch_tool_type": "freeform",
+      "priority": 1
+    }
+  ]
+}

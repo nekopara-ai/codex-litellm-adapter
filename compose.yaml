@@ -1,0 +1,26 @@
+services:
+  adapter:
+    build: .
+    ports:
+      - "127.0.0.1:4001:4001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      CODEX_ADAPTER_UPSTREAM: ${CODEX_ADAPTER_UPSTREAM:-http://host.docker.internal:4000}
+      CODEX_ADAPTER_LOG_LEVEL: ${CODEX_ADAPTER_LOG_LEVEL:-INFO}
+      CODEX_ADAPTER_NS_PASSTHROUGH: ${CODEX_ADAPTER_NS_PASSTHROUGH:-^gpt-}
+      CODEX_ADAPTER_NS_FORCE_FLATTEN: ${CODEX_ADAPTER_NS_FORCE_FLATTEN:-(?!)}
+      CODEX_ADAPTER_MAX_BODY_BYTES: ${CODEX_ADAPTER_MAX_BODY_BYTES:-134217728}
+    volumes:
+      - replay:/state
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
+
+volumes:
+  replay:

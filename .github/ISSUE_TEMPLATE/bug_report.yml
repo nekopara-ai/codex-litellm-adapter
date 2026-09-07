@@ -1,0 +1,20 @@
+name: Bug report
+description: Report an adapter problem using a synthetic reproduction.
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic content. Remove keys, internal addresses, user identifiers, and real conversation data.
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Adapter, Python, and LiteLLM versions

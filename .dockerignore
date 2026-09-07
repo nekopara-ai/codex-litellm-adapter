@@ -1,0 +1,9 @@
+*
+!src/
+!src/**
+!pyproject.toml
+!README.md
+!LICENSE
+
+**/__pycache__/
+**/*.pyc
