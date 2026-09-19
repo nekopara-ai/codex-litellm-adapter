@@ -19,6 +19,8 @@ The service has three local modules:
 
 Responses streams require a terminal response event. Ordinary Chat Completions SSE retains its `[DONE]` contract. Comments, SSE event IDs, and retry fields survive HTTP namespace rewriting. Request zstd decompression is provided by aiohttp and the Python zstd implementation; upstream compression is explicitly negotiated as identity.
 
+After a terminal Responses event is forwarded, the upstream stream is handed to a bounded background drain instead of being closed. LiteLLM runs some post-call guardrails only after that event, so closing immediately would cancel them. The drain reads and discards the remaining frames, stops at the configured deadline, and is cancelled with the application during shutdown.
+
 ## Failures and recovery
 
 | Condition | Behavior |
@@ -29,6 +31,7 @@ Responses streams require a terminal response event. Ordinary Chat Completions S
 | Responses stream ends without terminal event | Explicit incomplete-stream error. |
 | Upstream truncates a buffered JSON response | Structured 502; upstream socket timeout returns 504. |
 | Configured context budget error | At most one reduced-output retry. |
+| Guardrail traffic after the terminal event | Consumed by a bounded background drain; never forwarded to the client. |
 
 SQLite records are scoped by an HMAC derived from selected authentication/organization/project headers and the model. Reusing a response ID with another key or model does not recover the original snapshot. The key file must persist alongside the database across restarts.
 

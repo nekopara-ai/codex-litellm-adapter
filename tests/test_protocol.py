@@ -77,6 +77,13 @@ def test_removed_tool_does_not_shadow_top_level(monkeypatch):
     assert current["name"] == "demo__echo" and "namespace" not in current
 
 
+def test_non_string_call_type_is_ignored():
+    """A malformed item type must not crash the recursive rewriter."""
+    node = {"type": ["function_call"], "name": "demo__echo"}
+    server.restore_namespaced_calls(node, {"demo__echo": ("demo", "echo", "function")})
+    assert node["name"] == "demo__echo"
+
+
 def test_history_only_namespace_is_stable():
     payload = {
         "model": "local-model",
@@ -185,6 +192,49 @@ async def test_missing_terminal_is_signalled(gateway):
     )
     raw = await response.text()
     assert "upstream_incomplete_stream" in raw
+
+
+@pytest.mark.parametrize("transport", ["http", "websocket"])
+async def test_post_terminal_stream_is_drained(gateway, monkeypatch, transport):
+    """Guardrail traffic after the terminal event is consumed in the background."""
+    client, state = gateway
+    state["scenario"] = "post_terminal"
+    await server.cancel_active_drains()
+    body = tool_payload()
+    if transport == "http":
+        response = await client.post("/v1/responses", headers=AUTH, json={**body, "stream": True})
+        events = decode_events(await response.text())
+    else:
+        events = []
+        async with client.ws_connect("/v1/responses", headers=AUTH) as ws:
+            await ws.send_json({"type": "response.create", **body})
+            for _ in range(12):
+                frame = await asyncio.wait_for(ws.receive(), 3)
+                assert frame.type == WSMsgType.TEXT
+                event = json.loads(frame.data)
+                events.append(event)
+                if event["type"] in server.TERMINAL_RESPONSE_EVENTS:
+                    break
+    assert events[-1]["type"] == "response.completed"
+    # The client-visible stream stops at the terminal event; the guardrail-only
+    # frames must not leak into it.
+    assert not any(e["type"] == "response.post_terminal_guardrail" for e in events)
+    await asyncio.wait_for(state["post_terminal_drained"].wait(), 3)
+    await server.cancel_active_drains()
+
+
+async def test_drain_limit_skips_and_closes(gateway, monkeypatch):
+    client, state = gateway
+    state["scenario"] = "post_terminal"
+    monkeypatch.setattr(server, "MAX_ACTIVE_DRAINS", 1)
+    await server.cancel_active_drains()
+    response = await client.post(
+        "/v1/responses", headers=AUTH, json={**tool_payload(), "stream": True}
+    )
+    await response.text()
+    await asyncio.sleep(0)
+    assert len(server._ACTIVE_DRAIN_TASKS) <= 1
+    await server.cancel_active_drains()
 
 
 async def test_truncated_json_is_structured_502(gateway):

@@ -56,6 +56,17 @@ UPSTREAM_SOCK_READ_TIMEOUT_SECONDS = float(
 UPSTREAM_KEEPALIVE_TIMEOUT_SECONDS = float(
     os.environ.get("CODEX_ADAPTER_UPSTREAM_KEEPALIVE_TIMEOUT_SECONDS", "30")
 )
+# LiteLLM runs end-of-stream guardrails (llm_as_a_judge) after the terminal
+# response event. Keep reading the upstream stream for this long so those
+# post-call guardrails can finish; 0 disables the drain.
+POST_TERMINAL_DRAIN_SECONDS = float(
+    os.environ.get("CODEX_ADAPTER_POST_TERMINAL_DRAIN_SECONDS", "120")
+)
+# Bound how many background drains can run at once so a slow upstream cannot
+# accumulate unbounded sockets.
+MAX_ACTIVE_DRAINS = int(
+    os.environ.get("CODEX_ADAPTER_MAX_ACTIVE_DRAINS", str(max(1, UPSTREAM_POOL_LIMIT // 2)))
+)
 MAX_BODY_SIZE = int(os.environ.get("CODEX_ADAPTER_MAX_BODY_BYTES", str(128 * 1024**2)))
 MAX_SSE_EVENT_SIZE = int(os.environ.get("CODEX_ADAPTER_MAX_SSE_EVENT_BYTES", str(8 * 1024**2)))
 if (
@@ -65,6 +76,8 @@ if (
     or UPSTREAM_CONNECT_TIMEOUT_SECONDS <= 0
     or UPSTREAM_SOCK_READ_TIMEOUT_SECONDS <= 0
     or UPSTREAM_KEEPALIVE_TIMEOUT_SECONDS <= 0
+    or POST_TERMINAL_DRAIN_SECONDS < 0
+    or MAX_ACTIVE_DRAINS <= 0
 ):
     raise RuntimeError("adapter limits and timeouts must be positive")
 TEMPLATE_PATH = Path(
@@ -134,7 +147,6 @@ def title_model(slug: str) -> str:
     aliases = {
         "gpt": "GPT",
         "glm": "GLM",
-        "kimi": "Kimi",
         "vllm": "vLLM",
         "deepseek": "DeepSeek",
         "grok": "Grok",
@@ -576,7 +588,8 @@ def custom_tool_input(arguments: Any) -> str:
 def restore_namespaced_calls(node: Any, mapping: dict[str, ToolIdentity]) -> None:
     """Recursively restore namespace, name, and custom-call wire semantics."""
     if isinstance(node, dict):
-        if node.get("type") in {"function_call", "custom_tool_call"}:
+        node_type = node.get("type")
+        if isinstance(node_type, str) and node_type in {"function_call", "custom_tool_call"}:
             flat = node.get("name")
             if isinstance(flat, str) and flat in mapping:
                 namespace, original, kind = mapping[flat]
@@ -726,6 +739,18 @@ def build_codex_model(
     template = choose_template(slug, templates)
     item = dict(template) if template else {}
     window = context_window(model, info, template)
+    # Capability precedence: an explicit template declaration wins over the live
+    # LiteLLM catalog, which may be missing or stale for a self-hosted model.
+    vision_declared = None
+    if template:
+        template_modalities = template.get("input_modalities")
+        if isinstance(template_modalities, list):
+            vision_declared = "image" in template_modalities
+        if isinstance(template.get("supports_image_detail_original"), bool):
+            vision_declared = bool(template["supports_image_detail_original"])
+    vision_supported = (
+        vision_declared if vision_declared is not None else info.get("supports_vision") is True
+    )
     levels = reasoning_levels(info, template)
     instructions = item.get("base_instructions") or generic_instructions()
     mode = str(info.get("mode") or "chat")
@@ -769,14 +794,12 @@ def build_codex_model(
             "web_search_tool_type": item.get("web_search_tool_type", "text_and_image"),
             "truncation_policy": item.get("truncation_policy", {"mode": "tokens", "limit": 10000}),
             "supports_parallel_tool_calls": info.get("supports_function_calling") is not False,
-            "supports_image_detail_original": info.get("supports_vision") is True,
+            "supports_image_detail_original": vision_supported,
             "context_window": window,
             "max_context_window": window,
             "effective_context_window_percent": effective_context_window_percent(slug, item),
             "experimental_supported_tools": item.get("experimental_supported_tools", []),
-            "input_modalities": ["text", "image"]
-            if info.get("supports_vision") is True
-            else ["text"],
+            "input_modalities": ["text", "image"] if vision_supported else ["text"],
             "supports_search_tool": info.get("supports_web_search") is True,
             "use_responses_lite": item.get("use_responses_lite", False),
             "base_instructions": instructions,
@@ -1236,6 +1259,82 @@ def finalize_upstream_response(response: Any) -> None:
         response.close()
 
 
+_ACTIVE_DRAIN_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _discard_drain_task(task: asyncio.Task[None]) -> None:
+    _ACTIVE_DRAIN_TASKS.discard(task)
+    if task.cancelled():
+        return
+    error = task.exception()
+    if error is not None:
+        LOGGER.warning("upstream drain ended abnormally: %s", type(error).__name__)
+
+
+async def _consume_upstream_stream(response: Any) -> None:
+    # readany() avoids leaving a suspended async generator behind when the
+    # forwarding loop already broke out at the terminal event.
+    while True:
+        chunk = await response.content.readany()
+        if not chunk:
+            return
+
+
+async def drain_upstream_stream(response: Any) -> None:
+    """Read the remainder of an upstream SSE stream without forwarding it."""
+    try:
+        await asyncio.wait_for(
+            _consume_upstream_stream(response),
+            timeout=POST_TERMINAL_DRAIN_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        LOGGER.warning(
+            "upstream drain timed out after %.0fs; closing the stream",
+            POST_TERMINAL_DRAIN_SECONDS,
+        )
+    except Exception as exc:  # noqa: BLE001 - background task must not crash
+        LOGGER.warning("upstream drain ended abnormally: %s", type(exc).__name__)
+    finally:
+        finalize_upstream_response(response)
+
+
+def hand_off_upstream_response(response: Any, reason: str) -> bool:
+    """Keep an upstream stream alive after the client-visible terminal event.
+
+    LiteLLM runs end-of-stream guardrails (llm_as_a_judge) *after* it emits the
+    terminal response event. Closing the stream at that point cancels the
+    guardrail and leaves an empty guardrail entry, so keep reading the stream in
+    the background instead of closing it.
+
+    Returns True when the response was handed off and the caller must not
+    finalize it again.
+    """
+    if POST_TERMINAL_DRAIN_SECONDS <= 0 or response.content.at_eof():
+        return False
+    if len(_ACTIVE_DRAIN_TASKS) >= MAX_ACTIVE_DRAINS:
+        LOGGER.warning(
+            "upstream drain skipped (%s): %d drains already active",
+            reason,
+            len(_ACTIVE_DRAIN_TASKS),
+        )
+        return False
+    task = asyncio.create_task(drain_upstream_stream(response))
+    _ACTIVE_DRAIN_TASKS.add(task)
+    task.add_done_callback(_discard_drain_task)
+    LOGGER.debug("draining upstream stream after terminal event (%s)", reason)
+    return True
+
+
+async def cancel_active_drains() -> None:
+    """Stop background drains during shutdown so no task outlives the app."""
+    tasks = [task for task in _ACTIVE_DRAIN_TASKS if not task.done()]
+    if not tasks:
+        return
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
 async def stream_http_responses_to_websocket(
     request: web.Request,
     downstream: web.WebSocketResponse,
@@ -1284,6 +1383,7 @@ async def stream_http_responses_to_websocket(
         await send_websocket_error(downstream, "LiteLLM is unavailable", "upstream_error")
         return
 
+    terminal_seen = False
     try:
         if unsupported_content_encoding(response.headers) is not None:
             await send_websocket_error(
@@ -1321,7 +1421,6 @@ async def stream_http_responses_to_websocket(
 
         decoder = SSEJSONDecoder(mapping)
         collector = CompletedResponseCollector()
-        terminal_seen = False
         async for chunk in response.content.iter_any():
             for event in decoder.feed(chunk):
                 completed = collector.consume(event)
@@ -1374,7 +1473,8 @@ async def stream_http_responses_to_websocket(
                 downstream, "LiteLLM response stream failed", "upstream_stream_error"
             )
     finally:
-        finalize_upstream_response(response)
+        if not (terminal_seen and hand_off_upstream_response(response, "websocket terminal event")):
+            finalize_upstream_response(response)
 
 
 async def websocket_proxy(request: web.Request) -> web.StreamResponse:
@@ -1561,6 +1661,7 @@ async def proxy(request: web.Request) -> web.StreamResponse:
     downstream = web.StreamResponse(
         status=response.status, reason=response.reason, headers=downstream_headers
     )
+    terminal_seen = False
     try:
         await downstream.prepare(request)
         if buffered_body is not None:
@@ -1570,7 +1671,6 @@ async def proxy(request: web.Request) -> web.StreamResponse:
         rewriter = None
         capture_decoder = None
         collector = None
-        terminal_seen = False
         if (
             response.status == 200
             and "text/event-stream" in content_type
@@ -1643,7 +1743,8 @@ async def proxy(request: web.Request) -> web.StreamResponse:
         if transport is not None:
             transport.close()
     finally:
-        finalize_upstream_response(response)
+        if not (terminal_seen and hand_off_upstream_response(response, "http terminal event")):
+            finalize_upstream_response(response)
     return downstream
 
 
@@ -1662,6 +1763,7 @@ async def create_app() -> web.Application:
             limit=UPSTREAM_POOL_LIMIT,
             force_close=False,
             keepalive_timeout=UPSTREAM_KEEPALIVE_TIMEOUT_SECONDS,
+            enable_cleanup_closed=True,
         ),
         auto_decompress=False,
         cookie_jar=DummyCookieJar(),
@@ -1684,6 +1786,7 @@ async def create_app() -> web.Application:
     app.router.add_route("*", "/{path:.*}", proxy)
 
     async def close_session(application: web.Application) -> None:
+        await cancel_active_drains()
         await application["session"].close()
         await application["health_session"].close()
 

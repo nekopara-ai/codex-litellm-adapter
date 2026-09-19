@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0
+
+- Kept reading the upstream Responses stream after the client-visible terminal event so LiteLLM end-of-stream guardrails (`llm_as_a_judge`) can finish; background drains are bounded by count and time and are cancelled on shutdown.
+- Added `CODEX_ADAPTER_POST_TERMINAL_DRAIN_SECONDS` and `CODEX_ADAPTER_MAX_ACTIVE_DRAINS`.
+- Ignored non-string item `type` values while restoring namespaced calls, which previously raised `TypeError: unhashable type`.
+- Let a model template's `input_modalities` and `supports_image_detail_original` override a missing or stale `supports_vision` flag from the upstream catalog.
+- Enabled closed-connection cleanup on the inference connector.
+- Dropped the built-in `kimi` display-name alias; unknown slugs still get generic title casing.
+
 ## 0.1.0
 
 Initial public release of the reusable adapter core.

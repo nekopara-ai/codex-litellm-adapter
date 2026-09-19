@@ -58,6 +58,7 @@ async def gateway(monkeypatch, tmp_path):
         "health_calls": 0,
         "entered": asyncio.Event(),
         "release": asyncio.Event(),
+        "post_terminal_drained": asyncio.Event(),
     }
 
     async def upstream(request):
@@ -137,9 +138,27 @@ async def gateway(monkeypatch, tmp_path):
         )
         if scenario == "missing_terminal":
             events.pop()
-        return web.Response(
-            text=encode_events(events, state["multiline"]), content_type="text/event-stream"
-        )
+        payload_text = encode_events(events, state["multiline"])
+        if scenario == "post_terminal":
+            # Emit the terminal event first, then keep the stream open with
+            # guardrail-only traffic so the client is never blocked by it.
+            response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+            await response.prepare(request)
+            try:
+                await response.write(payload_text.encode())
+                for index in range(3):
+                    await asyncio.sleep(0.05)
+                    await response.write(
+                        encode_events(
+                            [{"type": "response.post_terminal_guardrail", "index": index}]
+                        ).encode()
+                    )
+                state["post_terminal_drained"].set()
+            except (ConnectionResetError, asyncio.CancelledError):
+                raise
+            await response.write_eof()
+            return response
+        return web.Response(text=payload_text, content_type="text/event-stream")
 
     app = web.Application()
     app.router.add_route("*", "/{path:.*}", upstream)

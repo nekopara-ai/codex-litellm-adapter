@@ -14,11 +14,15 @@ All settings are environment variables, loaded at process startup. Restart the a
 | `CODEX_ADAPTER_UPSTREAM_CONNECT_TIMEOUT_SECONDS` | `30` | Socket connection timeout. Pool queue waiting is separate. |
 | `CODEX_ADAPTER_UPSTREAM_SOCK_READ_TIMEOUT_SECONDS` | `660` | Upstream socket read timeout. |
 | `CODEX_ADAPTER_UPSTREAM_KEEPALIVE_TIMEOUT_SECONDS` | `30` | Idle connection retention. |
+| `CODEX_ADAPTER_POST_TERMINAL_DRAIN_SECONDS` | `120` | After forwarding a terminal Responses event, keep reading the upstream stream this long so end-of-stream guardrails can finish. `0` disables the drain. |
+| `CODEX_ADAPTER_MAX_ACTIVE_DRAINS` | half of the pool limit, minimum `1` | Maximum concurrent background drains. |
 | `CODEX_ADAPTER_MAX_BODY_BYTES` | `134217728` | Request body limit, 128 MiB. |
 | `CODEX_ADAPTER_MAX_SSE_EVENT_BYTES` | `8388608` | Maximum buffered SSE event, 8 MiB. |
 | `CODEX_ADAPTER_LOG_LEVEL` | `INFO` | Python logging level. |
 
 Health probes use their own two-connection pool and a five-second timeout. A healthy inference pool can remain busy without preventing an upstream health probe. There is no total deadline for long-running inference; use your gateway's admission control and timeouts for overall limits.
+
+LiteLLM runs some guardrails only after it emits the terminal Responses event. The adapter forwards that event immediately, then keeps the upstream stream open in the background for up to `CODEX_ADAPTER_POST_TERMINAL_DRAIN_SECONDS` so those guardrails can finish and be recorded. Guardrail-only frames are never forwarded to the client. When the drain limit is reached, the adapter logs a warning and closes the stream instead of queueing unbounded sockets. Background drains are cancelled during shutdown.
 
 ## Model catalog
 
